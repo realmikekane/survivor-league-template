@@ -1,0 +1,19 @@
+{
+  "name": "survivor-league",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NFL survivor pool for your family or friends: picks, buy-backs, the pot, and trash talk. Runs on Netlify.",
+  "scripts": {
+    "test": "node scripts/test-rules.mjs && node scripts/test-api.mjs && node scripts/test-client.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "@netlify/blobs": "^10.0.9",
+    "obscenity": "^0.4.6"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^4.3.0",
+    "jsdom": "^29.1.1"
+  }
+}

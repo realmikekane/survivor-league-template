@@ -1,0 +1,11 @@
+[build]
+  publish = "public"
+  # Deploys come from GitHub. Every build runs the full test suite first: a
+  # failing test fails the build and the live site stays on the last good deploy.
+  # After the tests pass, site-meta stamps the site URL and LEAGUE_NAME into the
+  # link-preview tags in index.html.
+  command = "npm test && node scripts/site-meta.mjs"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
