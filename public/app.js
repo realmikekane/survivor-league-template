@@ -159,7 +159,7 @@ let starSet = (() => { try { return new Set(JSON.parse(localStorage.getItem("sl_
 const saveStars = () => { try { localStorage.setItem("sl_stars", JSON.stringify([...starSet])); } catch {} };
 
 /* ---------- data cache ---------- */
-const APP_BUILD = "2026-09-27b"; // must match api.mjs (a test enforces it)
+const APP_BUILD = "2026-10-19a"; // must match api.mjs (a test enforces it)
 
 /* A phone tab can sleep for weeks and wake up running ancient code (which is
    how a user saw "Missing Pick!" on picks the server had happily saved).
@@ -1318,7 +1318,33 @@ async function renderPicks() {
   const mySlots = pickSlots(s.slots);
   if (!mySlots.length) {
     if (mySeq !== renderSeq) return; // superseded while loading
-  view.innerHTML = `<div class="card muted" style="max-width:420px;margin:24px auto;">No slots under your name. Text the commissioner.</div>`;
+    // On the roster with no slots: a returning player after the rollover. They opt in here.
+    const people = [st.players.find((p) => p.id === session.playerId), ...st.players.filter((p) => p.managedBy === session.playerId)].filter(Boolean);
+    if (!cfg.joinOpen || !people.length) {
+      view.innerHTML = `<div class="card muted" style="max-width:420px;margin:24px auto;">No slots under your name. Text the commissioner.</div>`;
+      return;
+    }
+    const max = cfg.maxSlotsPerPlayer || 3;
+    const opts = Array.from({ length: max }, (_, i) => `<option value="${i + 1}">${i + 1} slot${i ? "s" : ""} · ${fmtMoney((i + 1) * cfg.buyIn)}</option>`).join("");
+    view.innerHTML = `
+      <div class="card" style="max-width:460px;margin:24px auto;">
+        <h2>Enter the ${esc(String(cfg.seasonYear))} season</h2>
+        <p class="muted small">You're on the roster from last season, same PIN. Slots start fresh: ${fmtMoney(cfg.buyIn)} each, up to ${max}.</p>
+        ${people.map((p) => `<label class="field"><span>${esc(p.name)}</span><select class="enSlots" data-pid="${esc(p.id)}"><option value="0">Sitting this one out</option>${opts.replace('value="1"', 'value="1" selected')}</select></label>`).join("")}
+        <button class="btn primary block" id="enGo">I'm in</button>
+      </div>`;
+    $("#enGo").addEventListener("click", async () => {
+      const picks = $$(".enSlots").map((sel) => ({ playerId: sel.dataset.pid, slots: Number(sel.value) })).filter((x) => x.slots > 0);
+      if (!picks.length) return toast("Pick at least one slot for someone");
+      $("#enGo").disabled = true;
+      const trouble = [];
+      for (const x of picks) {
+        try { await api("/api/enter", { token: session.token, ...x }); } catch (e) { trouble.push(e.message); }
+      }
+      await loadState(true);
+      if (trouble.length) toast(trouble.join(" "), 6000); else toast(`You're in for ${cfg.seasonYear} 🎉`);
+      renderPicks();
+    });
     return;
   }
 
@@ -1595,10 +1621,35 @@ async function renderHof() {
     </div>` : ""}
     <div class="card">
       <h2>Season by season</h2>
-      ${hof.map((h) => `<div class="hofrow"><span class="yr">${h.year}</span><span class="names">${(h.champions || []).map((n) => `${esc(n)}${(h.flawless || []).includes(n) ? ` <span class="badge flaw" title="Won it all without ever buying back">💯 Flawless</span>` : ""}`).join(", ")}</span><span class="wk">${esc(h.note || "")}</span></div>`).join("") || `<p class="muted">History loading…</p>`}
+      ${hof.map((h) => `<div class="hofrow"><span class="yr">${(cfg.archivedSeasons || []).includes(h.year) ? `<a href="#/season?${h.year}" title="The ${h.year} final board">${h.year}</a>` : h.year}</span><span class="names">${(h.champions || []).map((n) => `${esc(n)}${(h.flawless || []).includes(n) ? ` <span class="badge flaw" title="Won it all without ever buying back">💯 Flawless</span>` : ""}`).join(", ")}</span><span class="wk">${esc(h.note || "")}</span></div>`).join("") || `<p class="muted">History loading…</p>`}
     </div>
     <p class="muted small">${cfg.established ? `Champions since ${esc(String(cfg.established))}. ` : ""}Multiple names in one year split that season's pot. 💯 Flawless = went the distance without a single buy-back.</p>
   `;
+}
+
+/* A finished season, read-only: the frozen board the rollover archived. */
+async function renderSeason() {
+  const y = Number(location.hash.split("?")[1]);
+  let st;
+  try { st = await api(`/api/state?season=${y}`); } catch {
+    view.innerHTML = `<div class="card"><h2>No archive for that season</h2><p class="muted"><a href="#/hof">← Hall of Fame</a></p></div>`;
+    return;
+  }
+  const s = st.snapshot;
+  const champ = (st.cfg.hallOfFame || []).find((h) => h.year === y);
+  const weeks = Array.from({ length: s.week || st.cfg.totalWeeks || 18 }, (_, i) => i + 1);
+  const cell = (x) => (x?.team ? `${esc(x.team.split(" ").pop())}${x.result === "loss" ? (x.buyback === "confirmed" ? " ✗💸" : " ✗") : ""}` : "");
+  view.innerHTML = `
+    <h1>${y} final board</h1>
+    ${champ ? `<div class="card reigncard"><div class="reign-k">👑 ${y} champion${champ.champions.length > 1 ? "s" : ""}</div><div class="reign-names">${champ.champions.map(esc).join(" · ")}</div>${champ.note ? `<p class="muted small" style="margin:6px 0 0;">${esc(champ.note)}</p>` : ""}</div>` : ""}
+    <div class="card">
+      <p class="muted small" style="margin-top:0;">${s.totalSlots} entries · ${fmtMoney(s.pot?.total)} pot · archived, read-only</p>
+      <div class="archwrap"><table class="archtbl">
+        <thead><tr><th>Slot</th><th>Finish</th>${weeks.map((w) => `<th>${w}</th>`).join("")}</tr></thead>
+        <tbody>${(s.slots || []).map((r) => `<tr><td>${esc(r.label)}</td><td>${r.status === "dead" ? `Out wk ${r.eliminatedWeek}` : "Survived"}</td>${weeks.map((w) => `<td>${cell(r.weeks?.[w])}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table></div>
+    </div>
+    <p class="muted small"><a href="#/hof">← Hall of Fame</a></p>`;
 }
 
 /* Note atop Join and Log in. The commissioner's text wins; while it's blank and
@@ -2486,6 +2537,16 @@ async function renderAdmin() {
       </div>
     </details>
 
+    <details class="adm" data-cell="newseason">
+      <summary>🏁 Start next season</summary>
+      <div class="inner">
+        ${A.cfg.lastRollover?.to === A.cfg.seasonYear && !A.slots.slots.length && !A.payments.entries.length ? `<div class="banner info">The ${A.cfg.lastRollover.from} season was archived ${esc(fmtKickTZ(A.cfg.lastRollover.at))}. Nobody has entered ${A.cfg.seasonYear} yet, so you can still take it back. <button class="btn sm" id="nsUndo">Undo the rollover</button></div>` : ""}
+        <p class="muted small">Archives the ${A.cfg.seasonYear} season into the Hall of Fame and opens ${A.cfg.seasonYear + 1} sign-ups. Every player carries over with the same PIN and household. Slots, picks, buy-backs, and the pot start empty. Returning players opt in from My Picks. Last season stays readable from the Hall of Fame.</p>
+        <button class="btn" id="nsPreview">Preview the ${A.cfg.seasonYear} wrap-up</button>
+        <div id="nsOut"></div>
+      </div>
+    </details>
+
     <details class="adm" data-cell="settings">
       <summary>⚙️ League settings</summary>
       <div class="inner">
@@ -2523,6 +2584,36 @@ async function renderAdmin() {
   $$("details.adm[data-cell]").forEach((d) => {
     d.open = admOpen.has(d.dataset.cell);
     d.addEventListener("toggle", () => { d.open ? admOpen.add(d.dataset.cell) : admOpen.delete(d.dataset.cell); });
+  });
+
+  /* Season rollover: acts at once (no staging), behind a typed year. */
+  const lines = (id) => $(id).value.split("\n").map((x) => x.trim()).filter(Boolean);
+  $("#nsPreview").addEventListener("click", async () => {
+    let p;
+    try { p = await adminOp("previewNextSeason", {}, { reload: false }); } catch (e) { return toast(e.message); }
+    $("#nsOut").innerHTML = `
+      <div class="banner${p.seasonOver ? " info" : ""}" style="margin-top:10px;">${p.seasonOver ? `The ${p.from} season is over.` : `The ${p.from} season isn't over: week ${p.lastWeek}, more than one slot standing.`} ${p.entries} entries, ${fmtMoney(p.pot)} pot.</div>
+      ${p.pendingBuybacks ? `<div class="banner">⚠ ${p.pendingBuybacks} buy-back${p.pendingBuybacks > 1 ? "s" : ""} still pending. Confirm or deny ${p.pendingBuybacks > 1 ? "them" : "it"} in Buy-backs first.</div>` : ""}
+      <label class="field"><span>Champions <span class="muted">(one per line; more than one splits the pot)</span></span><textarea id="nsChamps" rows="3">${esc(p.champions.join("\n"))}</textarea></label>
+      <label class="field"><span>Flawless <span class="muted">(champions who never bought back)</span></span><textarea id="nsFlaw" rows="2">${esc(p.flawless.join("\n"))}</textarea></label>
+      <label class="field"><span>Hall of Fame note</span><input id="nsNote" value="${esc(`${fmtMoney(p.pot)} pot · ${p.entries} entries`)}"></label>
+      ${p.seasonOver ? "" : `<label class="small" style="display:flex;align-items:center;gap:8px;margin:6px 0 10px;cursor:pointer;"><input type="checkbox" id="nsForce" style="width:auto;margin:0;"> End it early and archive anyway</label>`}
+      <label class="field"><span>Type ${p.to} to confirm</span><input id="nsConfirm" inputmode="numeric" placeholder="${p.to}" autocomplete="off"></label>
+      <button class="btn primary" id="nsGo"${p.pendingBuybacks ? " disabled" : ""}>Start the ${p.to} season</button>`;
+    $("#nsGo").addEventListener("click", async () => {
+      if (Number($("#nsConfirm").value.trim()) !== p.to) return toast(`Type ${p.to} to confirm`);
+      $("#nsGo").disabled = true;
+      try {
+        const r = await adminOp("startNextSeason", { confirm: p.to, champions: lines("#nsChamps"), flawless: lines("#nsFlaw"), note: $("#nsNote").value, force: !!$("#nsForce")?.checked }, { reload: false });
+        await loadState(true);
+        toast(`The ${r.seasonYear} season is open. ${r.carried} players carried over.`, 6000);
+        renderAdmin();
+      } catch (e) { toast(e.message, 6000); $("#nsGo").disabled = false; }
+    });
+  });
+  $("#nsUndo")?.addEventListener("click", async () => {
+    if (!confirm(`Put the league back on ${A.cfg.lastRollover.from}? The Hall of Fame entry comes off and sign-ups go back to how they were.`)) return;
+    try { await adminOp("undoNextSeason", {}, { reload: false }); await loadState(true); toast("Rollover undone"); renderAdmin(); } catch (e) { toast(e.message, 6000); }
   });
 
   $("#aOut").addEventListener("click", () => {
@@ -2741,7 +2832,7 @@ const routes = {
   standings: renderStandings, scores: renderScores, picks: renderPicks, money: renderMoney,
   log: renderLog, rules: renderRules, hof: renderHof, join: renderJoin, more: renderMore,
   admin: renderAdmin, login: renderLogin, account: renderAccount, demo: renderDemo, chat: renderChat,
-  install: renderInstall,
+  install: renderInstall, season: renderSeason,
 };
 function currentRoute() {
   const h = location.hash.replace(/^#\//, "").split("?")[0];

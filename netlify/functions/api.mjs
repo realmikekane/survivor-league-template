@@ -19,7 +19,7 @@ export const config = { path: "/api/*" };
 
 /* Bumped on client-affecting deploys. Served on /api/state so long-suspended
    phone tabs notice they are stale and refresh themselves. */
-const APP_BUILD = "2026-09-27b";
+const APP_BUILD = "2026-10-19a";
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -312,6 +312,39 @@ async function joinClosedReason(store, cfg, now) {
   } catch {} // no schedule on hand: fall back to the switch alone
   return null;
 }
+
+/* ---- season rollover ----
+   Every league doc is keyed by season, so starting the next one never rewrites
+   the last: it writes cfg and the new season's roster, nothing else. What a
+   rollover would archive comes from a forced rebuild, so the frozen snapshot is
+   the final word rather than whatever a viewer last warmed. */
+async function seasonReview(store, cfg, now) {
+  const S = cfg.seasonYear, total = cfg.totalWeeks ?? 18;
+  const snap = await rebuild(store, cfg, now, { force: true });
+  const [roster, revivals, overrides, last] = await Promise.all([
+    loadDoc(store, KEYS.roster(S), { players: [] }),
+    loadDoc(store, KEYS.revivals(S), { entries: [] }),
+    loadDoc(store, KEYS.overrides(S), {}),
+    getSchedule(store, cfg, total, now).catch(() => ({ games: [] })),
+  ]);
+  const rows = snap.slots || [];
+  const standing = rows.filter((r) => r.status !== "dead");
+  // Nobody left standing (everyone fell the same week): the last ones out share it.
+  const lastOut = Math.max(0, ...rows.map((r) => r.eliminatedWeek || 0));
+  const champRows = standing.length ? standing : rows.filter((r) => r.eliminatedWeek === lastOut && lastOut > 0);
+  const nameOf = (r) => roster.players.find((p) => p.id === r.playerId)?.name || r.label;
+  const champions = [...new Set(champRows.map(nameOf))];
+  const flawless = champions.filter((n) => champRows.some((r) => nameOf(r) === n && !r.buybacksUsed));
+  const games = last.games || [];
+  const finalWeekDone = snap.week === total && games.length > 0 && games.every((g) => g.completed || overrides[g.id]);
+  return {
+    from: S, to: S + 1, champions, flawless, pot: snap.pot?.total ?? 0, entries: rows.length, lastWeek: snap.week,
+    pendingBuybacks: revivals.entries.filter((r) => r.status === "pending").length,
+    finalWeekDone, seasonOver: finalWeekDone || (rows.length > 0 && standing.length <= 1),
+  };
+}
+const cleanNames = (list) => [...new Set((Array.isArray(list) ? list : []).map((n) => String(n || "").trim().slice(0, 80)).filter(Boolean))];
+
 const MAX_HOUSEHOLD = 10;
 const csvSafe = (s) => (/^[=+\-@\t\r]/.test(s) ? " " + s : s); // a leading space defuses spreadsheet formulas
 /* Chat keys sort by time; a per-instance counter keeps same-millisecond posts in order. */
@@ -476,7 +509,7 @@ const PHONE_RE = /^[\d\s()+.-]{7,20}$/;
 const publicCfg = (cfg) => ({
   leagueName: cfg.leagueName, seasonYear: cfg.seasonYear, buyIn: cfg.buyIn, buybackFee: cfg.buybackFee,
   suddenDeathWeek: cfg.suddenDeathWeek, totalWeeks: cfg.totalWeeks, maxSlotsPerPlayer: cfg.maxSlotsPerPlayer,
-  venmo: cfg.venmo, joinOpen: cfg.joinOpen, rulesText: cfg.rulesText, hallOfFame: cfg.hallOfFame || [],
+  venmo: cfg.venmo, joinOpen: cfg.joinOpen, rulesText: cfg.rulesText, hallOfFame: cfg.hallOfFame || [], archivedSeasons: cfg.archivedSeasons || [],
   contacts: cfg.contacts || [], leagueNote: cfg.leagueNote || "", joinNote: cfg.joinNote || "", hostName: hostName(cfg),
   established: cfg.established || "", timeZone: LEAGUE_TZ, tzLabel: tzLabel(),
 });
@@ -600,6 +633,22 @@ export default async (req, context) => {
     /* ----- public reads ----- */
 
     if (path === "/api/state" && method === "GET") {
+      // A finished season, read-only: the frozen board and that year's names.
+      const asked = Number(url.searchParams.get("season"));
+      if (asked && asked !== S) {
+        const old = (cfg.archivedSeasons || []).includes(asked) ? await getJSON(store, KEYS.snapshot(asked)) : null;
+        if (!old) return bad("No archive for that season.", 404);
+        const oldRoster = await loadDoc(store, KEYS.roster(asked), { players: [] });
+        // Only locked picks show; every game of a finished season has locked.
+        const { splitPreview: _sp, riders: _rd, ...rest } = old;
+        return json({
+          archived: true,
+          snapshot: { ...rest, pot: { total: old.pot?.total ?? 0, entries: old.pot?.entries ?? 0 }, slots: (old.slots || []).map((r) => slimRow(publicSlotView(r, false, null))) },
+          cfg: { ...publicCfg(cfg), seasonYear: asked },
+          players: oldRoster.players.map((p) => ({ id: p.id, name: p.name, managedBy: p.managedBy || null })),
+          serverNow: now.toISOString(), appVersion: APP_BUILD,
+        });
+      }
       let snap = await getJSON(store, KEYS.snapshot(S));
       if (snapshotIsStale(snap, now) || snap?.pot?.total === undefined || snap?.pot?.buybacks === undefined) { // pot shape changed: rebuild once
         try {
@@ -1159,6 +1208,34 @@ export default async (req, context) => {
         playerId: player.id, name: player.name, pin: player.pin, token,
         slots: mySlots.map((s) => ({ id: s.id, label: s.label })),
       });
+    }
+
+    /* Returning player: the roster carried over at the rollover, the slots did
+       not. Enter yourself or someone in your household for this season. */
+    if (path === "/api/enter" && method === "POST") {
+      const b = await readBody(req);
+      const sub = authSubject(b);
+      if (!sub || isAdminSub(sub)) return bad("Log in first.", 401);
+      const closed = await joinClosedReason(store, cfg, now);
+      if (closed) return bad(closed, 403);
+      const roster = await loadDoc(store, KEYS.roster(S), { players: [] });
+      const me = roster.players.find((p) => p.id === sub);
+      const target = roster.players.find((p) => p.id === (b.playerId || sub));
+      if (!me || !target || (target.id !== sub && target.managedBy !== sub)) return bad("You can enter yourself or your household, nobody else.", 403);
+      const n = Math.min(Math.max(Number(b.slots) || 1, 1), cfg.maxSlotsPerPlayer ?? 3);
+      const mySlots = Array.from({ length: n }, (_, i) => ({
+        id: newId("s"), playerId: target.id, label: n === 1 ? target.name : `${target.name} (${i + 1})`, createdAt: now.toISOString(), withdrawn: false,
+      }));
+      let already = false;
+      await mutateDoc(store, KEYS.slots(S), { slots: [] }, (d) => {
+        if (d.slots.some((s2) => s2.playerId === target.id && !s2.withdrawn)) { already = true; return undefined; }
+        d.slots.push(...mySlots);
+        return d;
+      });
+      if (already) return bad(`${target.name} is already in the ${S} season.`, 409);
+      await appendLog(store, S, { action: "join", actor: me.name, actorId: sub, note: `${target.name} is back for ${S} with ${n} slot${n > 1 ? "s" : ""}` });
+      await rebuild(store, cfg, now, { force: true });
+      return json({ playerId: target.id, name: target.name, slots: mySlots.map((s2) => ({ id: s2.id, label: s2.label })) });
     }
 
     if (path === "/api/auth" && method === "POST") {
@@ -1842,6 +1919,62 @@ export default async (req, context) => {
         mode = ["buyIn", "buybackFee", "suddenDeathWeek", "maxSlotsPerPlayer"].some((k) => b.patch?.[k] !== undefined) ? "full" : "none";
         await setJSON(store, KEYS.cfg, cfg);
         await log({ action: "config", note: `Updated: ${Object.keys(b.patch || {}).join(", ")}` });
+      } else if (op === "previewNextSeason") {
+        return json(await seasonReview(store, cfg, now));
+      } else if (op === "startNextSeason") {
+        const next = S + 1;
+        if (Number(b.confirm) !== next) return bad(`Type ${next} to confirm.`);
+        const rev = await seasonReview(store, cfg, now);
+        if (rev.pendingBuybacks) return bad(`${rev.pendingBuybacks} buy-back${rev.pendingBuybacks > 1 ? "s are" : " is"} still pending. Confirm or deny first; the pot depends on it.`, 409);
+        if (!rev.seasonOver && b.force !== true) return bad(`The ${S} season isn't over (week ${rev.lastWeek}, more than one slot standing). Tick "end it early" to archive it anyway.`, 409);
+        const champions = cleanNames(b.champions ?? rev.champions);
+        if (!champions.length) return bad("Name at least one champion.");
+        const flawless = cleanNames(b.flawless ?? rev.flawless).filter((n) => champions.includes(n));
+        const [nextSlots, nextRoster, roster] = await Promise.all([
+          loadDoc(store, KEYS.slots(next), { slots: [] }),
+          getJSON(store, KEYS.roster(next)),
+          loadDoc(store, KEYS.roster(S), { players: [] }),
+        ]);
+        if (nextSlots.slots.length) return bad(`The ${next} season already has entries.`, 409);
+        // Freeze the outgoing board. Nothing rebuilds it once seasonYear moves on.
+        await mutateDoc(store, KEYS.snapshot(S), null, (snap) => (snap ? { ...snap, archived: true, archivedAt: now.toISOString() } : undefined));
+        // Same ids, so tokens already on phones keep working; same PINs and households.
+        if (!nextRoster) await setJSON(store, KEYS.roster(next), { players: roster.players });
+        const note = String(b.note ?? `$${Number(rev.pot).toLocaleString()} pot · ${rev.entries} entries`).trim().slice(0, 200);
+        cfg.lastRollover = { from: S, to: next, at: now.toISOString(), joinOpenBefore: !!cfg.joinOpen, hallOfFameBefore: cfg.hallOfFame || [], rosterCreated: !nextRoster };
+        cfg.hallOfFame = [...(cfg.hallOfFame || []).filter((h) => h.year !== S), { year: S, champions, ...(flawless.length ? { flawless } : {}), ...(note ? { note } : {}) }];
+        cfg.archivedSeasons = [...new Set([...(cfg.archivedSeasons || []), S])];
+        cfg.seasonYear = next;
+        cfg.joinOpen = true;
+        await setJSON(store, KEYS.cfg, cfg);
+        await log({ action: "season-archived", note: `${S} archived. Champion${champions.length > 1 ? "s" : ""}: ${champions.join(", ")}` });
+        await appendLog(store, next, { actor: "commissioner", action: "season-started", note: `${next} season started; ${roster.players.length} player${roster.players.length === 1 ? "" : "s"} carried over` });
+        await rebuild(store, cfg, now, { force: true });
+        return json({ ok: true, seasonYear: next, carried: roster.players.length });
+      } else if (op === "undoNextSeason") {
+        const lr = cfg.lastRollover;
+        if (!lr || lr.to !== S) return bad("There's no rollover to undo.", 409);
+        const [slotsDoc, payments, picks, roster, prevRoster] = await Promise.all([
+          loadDoc(store, KEYS.slots(S), { slots: [] }),
+          loadDoc(store, KEYS.payments(S), { entries: [] }),
+          listKeys(store, KEYS.pickPrefix(S)),
+          loadDoc(store, KEYS.roster(S), { players: [] }),
+          loadDoc(store, KEYS.roster(lr.from), { players: [] }),
+        ]);
+        if (slotsDoc.slots.length || payments.entries.length || picks.length) return bad(`The ${S} season has entries or payments now. Undo is off.`, 409);
+        // A PIN or email changed since the rollover would be lost by deleting this roster.
+        if (lr.rosterCreated && JSON.stringify(roster.players) !== JSON.stringify(prevRoster.players)) return bad("Someone changed their details since the rollover. Undo is off.", 409);
+        if (lr.rosterCreated) await store.delete(KEYS.roster(S));
+        await store.delete(KEYS.snapshot(S));
+        cfg.seasonYear = lr.from;
+        cfg.joinOpen = lr.joinOpenBefore;
+        cfg.hallOfFame = lr.hallOfFameBefore;
+        cfg.archivedSeasons = (cfg.archivedSeasons || []).filter((y) => y !== lr.from);
+        delete cfg.lastRollover;
+        await setJSON(store, KEYS.cfg, cfg);
+        await appendLog(store, lr.from, { actor: "commissioner", action: "season-restored", note: `Rollover to ${S} undone; back to ${lr.from}` });
+        await rebuild(store, cfg, now, { force: true });
+        return json({ ok: true, seasonYear: lr.from });
       } else if (op === "purgeLog") {
         mode = "none";
         const slotsDoc = await loadDoc(store, KEYS.slots(S), { slots: [] });

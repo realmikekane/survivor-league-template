@@ -403,5 +403,72 @@ async function go(win, hash) {
   dom.window.close();
 }
 
+/* ---- season rollover: desk control, returning-player opt-in, archived board ---- */
+const withRoutes = (over) => (win) => {
+  const base = makeFetch(win);
+  return async (path, opts = {}) => {
+    const url = new URL(String(path), "https://test.local");
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    const hit = over(url, body);
+    if (hit === undefined) return base(path, opts);
+    calls.push({ path: url.pathname, body });
+    return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(hit)), text: async () => JSON.stringify(hit) };
+  };
+};
+async function bootWith(over, flags) {
+  let win0 = null;
+  const r = await boot({ ...flags, fetchImpl: (...a) => withRoutes(over)(win0)(...a) });
+  win0 = r.win;
+  return r;
+}
+{
+  calls = [];
+  const preview = { from: 2026, to: 2027, champions: ["Alpha", "Bravo"], flawless: ["Alpha"], pot: 50, entries: 4, lastWeek: 18, pendingBuybacks: 0, finalWeekDone: true, seasonOver: true };
+  const { dom, win } = await bootWith((url, body) => (url.pathname === "/api/admin/op" && body?.op === "previewNextSeason" ? preview
+    : url.pathname === "/api/admin/op" && body?.op === "startNextSeason" ? { ok: true, seasonYear: 2027, carried: 3 } : undefined), { admin: true });
+  await go(win, "#/admin");
+  const q = (s) => win.document.querySelector(s);
+  check("desk: the next-season cell is there", !!q('[data-cell="newseason"]') && !!q("#nsPreview"), viewHTML(win).slice(0, 120));
+  q("#nsPreview").click();
+  await new Promise((r) => setTimeout(r, 20));
+  check("desk: preview prefills the champions", q("#nsChamps")?.value === "Alpha\nBravo" && q("#nsFlaw")?.value === "Alpha" && !q("#nsForce"), q("#nsOut")?.innerHTML.slice(0, 200));
+  q("#nsConfirm").value = "2026";
+  q("#nsGo").click();
+  await new Promise((r) => setTimeout(r, 20));
+  check("desk: the wrong year does not start it", !calls.some((c) => c.body?.op === "startNextSeason"));
+  q("#nsConfirm").value = "2027";
+  q("#nsGo").click();
+  await new Promise((r) => setTimeout(r, 30));
+  const sent = calls.find((c) => c.body?.op === "startNextSeason")?.body;
+  check("desk: start sends the typed year and the edited lists", sent?.confirm === 2027 && sent.champions.join() === "Alpha,Bravo" && sent.flawless.join() === "Alpha" && sent.force === false, JSON.stringify(sent));
+  check("no uncaught errors in the rollover flow", unhandled.length === 0, unhandled.join(" | "));
+  dom.window.close();
+}
+{
+  calls = [];
+  const empty = { ...STATE, snapshot: { ...STATE.snapshot, slots: [], totalSlots: 0 }, owed: null, cfg: { ...STATE.cfg, seasonYear: 2027 } };
+  const { dom, win } = await bootWith((url) => (url.pathname === "/api/state" ? empty : url.pathname === "/api/enter" ? { slots: [{ id: "n1", label: "Alpha" }] } : undefined), { player: true });
+  await go(win, "#/picks");
+  const sels = [...win.document.querySelectorAll(".enSlots")];
+  check("opt-in: a returning player sees themselves and their household", sels.length === 2 && /Enter the 2027 season/.test(viewHTML(win)) && sels.every((s) => s.value === "1"), viewHTML(win).slice(0, 200));
+  sels[1].value = "0";
+  win.document.querySelector("#enGo").click();
+  await new Promise((r) => setTimeout(r, 30));
+  const entered = calls.filter((c) => c.path === "/api/enter").map((c) => c.body);
+  check("opt-in: enters only who was picked", entered.length === 1 && entered[0].playerId === "p1" && entered[0].slots === 1, JSON.stringify(entered));
+  dom.window.close();
+}
+{
+  const archived = { archived: true, snapshot: { ...STATE.snapshot, week: 18 }, cfg: { ...STATE.cfg, archivedSeasons: [2025] }, players: STATE.players };
+  const { dom, win } = await bootWith((url) => (url.pathname === "/api/state" && url.searchParams.get("season") === "2025" ? archived
+    : url.pathname === "/api/state" ? { ...STATE, cfg: { ...STATE.cfg, archivedSeasons: [2025] } } : undefined));
+  await go(win, "#/hof");
+  check("hall of fame links an archived year", /href="#\/season\?2025"/.test(viewHTML(win)));
+  await go(win, "#/season?2025");
+  const v = viewHTML(win);
+  check("archived board renders read-only", !broke(win) && /2025 final board/.test(v) && /Out wk 2/.test(v) && /Seahawks/.test(v) && /archived, read-only/.test(v), v.slice(0, 200));
+  dom.window.close();
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

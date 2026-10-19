@@ -805,5 +805,95 @@ check("manager slots gone", !r.json.snapshot.slots.some((s) => s.playerId === A.
   check("state: the public config carries the league clock", r.json.cfg.timeZone === "America/Los_Angeles" && r.json.cfg.tzLabel === "PT", JSON.stringify([r.json.cfg.timeZone, r.json.cfg.tzLabel]));
 }
 
+/* ---- season rollover: a fresh league, archived and carried into the next year ---- */
+{
+  const mainStore = globalThis.__SL_TEST_STORE;
+  const mem = new MemStore();
+  globalThis.__SL_TEST_STORE = mem;
+  const op = (o, extra = {}) => call("/api/admin/op", { token: ADM2, op: o, ...extra });
+  r = await call("/api/bootstrap", { adminPin: "55556666", seasonYear: 2026, hallOfFame: [{ year: 2025, champions: ["Old Timer"] }] });
+  const ADM2 = r.json.adminToken;
+  const al = (await call("/api/join", { name: "Alice Ace", pin: "4321", email: "alice@test.com", slots: 1 })).json;
+  const bob = (await call("/api/household", { token: al.token, name: "Bobby Ace", slots: 1 })).json;
+  const carl = (await call("/api/join", { name: "Carl Cole", pin: "8765", email: "carl@test.com", slots: 2 })).json;
+  await op("addPayment", { slotId: carl.slots[0].id, type: "buyin" });
+
+  r = await op("previewNextSeason");
+  check("rollover: preview names the next year", r.json.from === 2026 && r.json.to === 2027, r.text.slice(0, 200));
+  check("rollover: preview finds everyone standing as champions", ["Alice Ace", "Bobby Ace", "Carl Cole"].every((n) => r.json.champions.includes(n)) && r.json.flawless.length === 3, JSON.stringify(r.json.champions));
+  check("rollover: three standing is not over", r.json.seasonOver === false && r.json.entries === 4, r.text.slice(0, 200));
+  check("rollover: preview writes nothing", (await storeGet(mem, "cfg")).seasonYear === 2026);
+
+  r = await op("startNextSeason", { confirm: 2028, force: true });
+  check("rollover: wrong year is refused", r.status === 400 && /2027/.test(r.json.error), r.text);
+  r = await op("startNextSeason", { confirm: 2027 });
+  check("rollover: an unfinished season is refused without force", r.status === 409 && /end it early/.test(r.json.error), r.text);
+  await storeSet(mem, "revivals:2026", { entries: [{ id: "rv_x", slotId: carl.slots[1].id, lossWeek: 1, status: "pending" }] });
+  r = await op("startNextSeason", { confirm: 2027, force: true });
+  check("rollover: a pending buy-back blocks it", r.status === 409 && /pending/.test(r.json.error), r.text);
+  await storeSet(mem, "revivals:2026", { entries: [] });
+  const oldSlots = JSON.stringify(await storeGet(mem, "slots:2026"));
+  const oldPays = JSON.stringify(await storeGet(mem, "payments:2026"));
+
+  r = await op("startNextSeason", { confirm: 2027, force: true, champions: ["Carl Cole"], flawless: ["Carl Cole", "Not A Champ"] });
+  check("rollover: starts", r.status === 200 && r.json.seasonYear === 2027 && r.json.carried === 3, r.text);
+  const c2 = await storeGet(mem, "cfg");
+  const hof26 = c2.hallOfFame.find((h) => h.year === 2026);
+  check("rollover: hall of fame gets the champion, keeps history", hof26?.champions.join() === "Carl Cole" && hof26.flawless.join() === "Carl Cole" && c2.hallOfFame.some((h) => h.year === 2025), JSON.stringify(c2.hallOfFame));
+  check("rollover: sign-ups reopen and the year is archived", c2.joinOpen === true && c2.archivedSeasons.includes(2026));
+  check("rollover: old season docs untouched", JSON.stringify(await storeGet(mem, "slots:2026")) === oldSlots && JSON.stringify(await storeGet(mem, "payments:2026")) === oldPays);
+  check("rollover: old board frozen", (await storeGet(mem, "snapshot:2026"))?.archived === true);
+  r = await call("/api/state");
+  check("rollover: new season is empty with a $0 pot", r.json.cfg.seasonYear === 2027 && r.json.snapshot.slots.length === 0 && r.json.snapshot.pot.total === 0, r.text.slice(0, 200));
+  check("rollover: roster carries over with households", r.json.players.length === 3 && r.json.players.find((p) => p.name === "Bobby Ace")?.managedBy === al.playerId);
+  r = await call("/api/auth", { playerId: carl.playerId, pin: "8765" });
+  check("rollover: old PIN still logs in", r.status === 200 && r.json.token, r.text);
+  r = await call(`/api/state?season=2026`);
+  check("rollover: last season reads back, archived", r.json.archived === true && r.json.cfg.seasonYear === 2026 && r.json.snapshot.slots.length === 4 && r.json.snapshot.pot.total === 40, r.text.slice(0, 200));
+  r = await call(`/api/state?season=2019`);
+  check("rollover: an unknown season is a 404", r.status === 404);
+
+  // Undo while nothing has happened, then roll forward again.
+  r = await op("undoNextSeason");
+  check("rollover: undo restores the year and hall of fame", r.status === 200 && (await storeGet(mem, "cfg")).seasonYear === 2026 && !(await storeGet(mem, "cfg")).hallOfFame.some((h) => h.year === 2026) && !(await storeGet(mem, "roster:2027")), r.text);
+  r = await call("/api/state");
+  check("rollover: after undo the old season is live again", r.json.cfg.seasonYear === 2026 && r.json.snapshot.slots.length === 4 && !r.json.snapshot.archived, r.text.slice(0, 160));
+  r = await op("undoNextSeason");
+  check("rollover: nothing to undo twice", r.status === 409);
+  r = await op("startNextSeason", { confirm: 2027, force: true, champions: ["Carl Cole"] });
+  check("rollover: starts again after an undo", r.status === 200);
+
+  // Returning players opt in, for themselves and their household.
+  r = await call("/api/enter", { token: al.token, slots: 2 });
+  check("enter: a returning player opts in with an old token", r.status === 200 && r.json.slots.length === 2 && r.json.slots[0].label === "Alice Ace (1)", r.text);
+  r = await call("/api/enter", { token: al.token, slots: 1 });
+  check("enter: once per season", r.status === 409, r.text);
+  r = await call("/api/enter", { token: al.token, playerId: bob.playerId, slots: 1 });
+  check("enter: a manager enters their household", r.status === 200 && r.json.name === "Bobby Ace", r.text);
+  r = await call("/api/enter", { token: al.token, playerId: carl.playerId, slots: 1 });
+  check("enter: nobody else's player", r.status === 403, r.text);
+  r = await call("/api/enter", { token: ADM2, slots: 1 });
+  check("enter: not the commissioner", r.status === 401);
+  r = await call("/api/state");
+  check("enter: new slots show on the new board", r.json.snapshot.slots.length === 3, r.text.slice(0, 120));
+  r = await op("undoNextSeason");
+  check("rollover: undo refused once anyone entered", r.status === 409 && /Undo is off/.test(r.json.error), r.text);
+  await op("setConfig", { patch: { joinOpen: false } });
+  r = await call("/api/enter", { token: carl.token, slots: 1 });
+  check("enter: closed sign-ups stop it", r.status === 403, r.text);
+
+  // A PIN change in the new season also turns undo off.
+  globalThis.__SL_TEST_STORE = new MemStore();
+  r = await call("/api/bootstrap", { adminPin: "55556666", seasonYear: 2026 });
+  const ADM3 = r.json.adminToken;
+  const d = (await call("/api/join", { name: "Dana Dee", pin: "1212", email: "dana@test.com", slots: 1 })).json;
+  r = await call("/api/admin/op", { token: ADM3, op: "startNextSeason", confirm: 2027 });
+  check("rollover: one slot standing counts as over", r.status === 200, r.text);
+  await call("/api/setpin", { token: d.token, pin: "3434" });
+  r = await call("/api/admin/op", { token: ADM3, op: "undoNextSeason" });
+  check("rollover: undo refused after a PIN change", r.status === 409 && /changed their details/.test(r.json.error), r.text);
+  globalThis.__SL_TEST_STORE = mainStore;
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
