@@ -13,7 +13,6 @@
     "obscenity": "^0.4.6"
   },
   "devDependencies": {
-    "@netlify/functions": "^4.3.0",
     "jsdom": "^29.1.1"
   }
 }

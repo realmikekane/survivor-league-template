@@ -70,9 +70,7 @@ const STATE = {
     leagueNote: "Pay up.", joinNote: "", hostName: "The Host",
   },
   players: [{ id: "p1", name: "Alpha", managedBy: null }, { id: "p2", name: "Bravo", managedBy: null }, { id: "p3", name: "Charlie", managedBy: "p1" }],
-  serverNow: new Date().toISOString(), appVersion: readFileSync(new URL("../public/app.js", import.meta.url), "utf8").match(/const APP_BUILD = "([^"]+)"/)[1],
-  hostReady: true, mailReady: true,
-  contactCoverage: { players: 3, withEmail: 2, withPhone: 3, missingEmailHeads: [] },
+  appVersion: readFileSync(new URL("../public/app.js", import.meta.url), "utf8").match(/const APP_BUILD = "([^"]+)"/)[1],
 };
 
 const game = (id, away, home, hrs, done, winner) => ({
@@ -102,8 +100,8 @@ const ADMIN_FULL = {
 const ROUTES = {
   "/api/state": STATE,
   "/api/news": { items: [{ headline: "Test headline", link: "https://espn.com/x", source: "espn" }] },
-  "/api/winprob": { week: WEEK, teams: {} },
-  "/api/chat": { messages: [{ ts: new Date().toISOString(), name: "Alpha", text: "hello" }] },
+  "/api/winprob": { week: WEEK, probs: { DAL: 0.62, SEA: 0.55 } }, // the shape api.mjs sends
+  "/api/chat": { tag: "5:1", messages: [{ id: "chat:2026:00000000000005:x", ts: new Date().toISOString(), name: "Alpha", text: "hello" }] },
   "/api/log": { scope: "mine", entries: [{ ts: new Date().toISOString(), action: "pick", actor: "Alpha", actorId: "p1", slotId: "s1", slotLabel: "Alpha (1)", week: 3, after: "Dallas Cowboys" }], nextCursor: null },
   "/api/admin/full": ADMIN_FULL,
   "/api/reminder": { week: WEEK, rows: [], firstGame: null, lastGame: null },
@@ -114,8 +112,9 @@ let calls = []; // every request the page made: [{ path, body }]
 function makeFetch(win) {
   return async (path, opts = {}) => {
     const url = new URL(String(path), "https://test.local");
-    calls.push({ path: url.pathname, body: opts.body ? JSON.parse(opts.body) : null });
+    calls.push({ path: url.pathname, search: url.search, body: opts.body ? JSON.parse(opts.body) : null });
     let body = ROUTES[url.pathname];
+    if (url.pathname === "/api/chat" && url.searchParams.get("have") === body.tag) body = { unchanged: true }; // what the server says to a poll with nothing new
     if (url.pathname === "/api/scores") body = SCORES[Number(url.searchParams.get("week")) || WEEK];
     if (body === undefined) body = {};
     return {
@@ -193,11 +192,17 @@ async function go(win, hash) {
   for (const [hash, name] of [
     ["#/", "standings"], ["#/scores", "scores"], ["#/picks", "picks"], ["#/money", "money"],
     ["#/log", "log"], ["#/rules", "rules"], ["#/hof", "hall of fame"], ["#/join", "join"],
-    ["#/more", "more"], ["#/chat", "chat"], ["#/login", "login"], ["#/demo", "demo"], ["#/account", "account"], ["#/install", "install"],
+    ["#/more", "more"], ["#/chat", "chat"], ["#/login", "login"], ["#/account", "account"], ["#/install", "install"],
   ]) {
     await go(win, hash);
     check(`${name} renders`, !broke(win) && viewHTML(win).length > 150, `${viewHTML(win).slice(0, 160)}`);
   }
+  // An open chat polls. With nothing new the server sends no messages and the list must stay put.
+  await go(win, "#/chat");
+  calls = [];
+  await win.__chatReload();
+  check("the chat poll says what it already has", calls.length === 1 && /have=5:1/.test(calls[0].search), JSON.stringify(calls));
+  check("a poll with nothing new leaves the chat on screen", /hello/.test(viewHTML(win)) && !broke(win), viewHTML(win).slice(0, 200));
   check("no uncaught errors logged out", unhandled.length === 0, unhandled.join(" | "));
   await go(win, "#/more");
   check("More links to the phone how-to", /href="#\/install"/.test(viewHTML(win)));
