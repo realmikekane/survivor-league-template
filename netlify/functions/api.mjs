@@ -9,7 +9,7 @@ import { askHost, hostConfigured, hostShouldReply, DEFAULT_HOST_NAME, HOST_PERSO
 import { blobStore, getJSON, setJSON, listJSON, listKeys, getManyJSON, mutateDoc } from "../../lib/store.mjs";
 import { fetchClosingLine, fetchWeek, isStale } from "../../lib/espn.mjs";
 import {
-  computeStandings, aggregateStandings, currentWeek, evaluateSlot, validatePick, validateBuyback, standingOf, stalePickWeek,
+  computeStandings, aggregateStandings, evaluateSlot, validatePick, validateBuyback, standingOf, stalePickWeek,
   gameForTeam, gameStarted, publicSlotView, computePot,
 } from "../../lib/rules.mjs";
 
@@ -19,7 +19,7 @@ export const config = { path: "/api/*" };
 
 /* Bumped on client-affecting deploys. Served on /api/state so long-suspended
    phone tabs notice they are stale and refresh themselves. */
-const APP_BUILD = "2026-10-19a";
+const APP_BUILD = "2026-11-10a";
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -450,7 +450,7 @@ async function postHostLine(store, cfg, text, extra = {}) {
 const hostStateOf = (doc, now) => {
   const d = doc || {};
   const day = tzDay(now);
-  return { on: d.on !== false, muteUntil: d.muteUntil || null, day: d.day === day ? day : day, replies: d.day === day ? d.replies || 0 : 0, attempts: d.day === day ? d.attempts || 0 : 0, unprompted: d.day === day ? d.unprompted || 0 : 0, lastReplyAt: d.lastReplyAt || null, lastAttemptAt: d.lastAttemptAt || null, lastUnpromptedAt: d.lastUnpromptedAt || null, lastError: d.lastError || null, lastLine: d.lastLine || null };
+  return { on: d.on !== false, muteUntil: d.muteUntil || null, day, replies: d.day === day ? d.replies || 0 : 0, attempts: d.day === day ? d.attempts || 0 : 0, unprompted: d.day === day ? d.unprompted || 0 : 0, lastReplyAt: d.lastReplyAt || null, lastAttemptAt: d.lastAttemptAt || null, lastUnpromptedAt: d.lastUnpromptedAt || null, lastError: d.lastError || null, lastLine: d.lastLine || null };
 };
 
 /* ---- the snuffing ----
@@ -646,21 +646,34 @@ export default async (req, context) => {
           snapshot: { ...rest, pot: { total: old.pot?.total ?? 0, entries: old.pot?.entries ?? 0 }, slots: (old.slots || []).map((r) => slimRow(publicSlotView(r, false, null))) },
           cfg: { ...publicCfg(cfg), seasonYear: asked },
           players: oldRoster.players.map((p) => ({ id: p.id, name: p.name, managedBy: p.managedBy || null })),
-          serverNow: now.toISOString(), appVersion: APP_BUILD,
+          appVersion: APP_BUILD,
         });
       }
       let snap = await getJSON(store, KEYS.snapshot(S));
-      if (snapshotIsStale(snap, now) || snap?.pot?.total === undefined || snap?.pot?.buybacks === undefined) { // pot shape changed: rebuild once
-        try {
-          snap = await rebuild(store, cfg, now, { existing: snap });
-        } catch (e) {
-          if (!snap) throw e; // nothing to degrade to
-          console.error("rebuild failed; serving stale snapshot", e); // e.g. ESPN outage with cold cache
+      if (snapshotIsStale(snap, now)) {
+        // Nothing moves on its own between games: picks, payments and desk edits
+        // splice into the stored snapshot as they happen, so before the next
+        // kickoff an old snapshot is still a true one. Serve it now and rebuild
+        // behind the response, because a rebuild reads every pick blob (seconds,
+        // in a league of a few hundred entries) and nobody should sit through
+        // that to open the board. Live, or past a kickoff, the request waits:
+        // that is when picks reveal. The one-hour ceiling is the self-heal if a
+        // background rebuild never lands.
+        const quiet = snap?.slots && !snap.liveNow && !(snap.nextKickoff && now >= new Date(snap.nextKickoff)) && now - new Date(snap.builtAt) < 3600e3;
+        const fresh = rebuild(store, cfg, now, { existing: snap });
+        if (quiet) context.waitUntil(fresh.catch((e) => console.error("background rebuild failed", e)));
+        else {
+          try { snap = await fresh; }
+          catch (e) {
+            if (!snap) throw e; // nothing to degrade to
+            console.error("rebuild failed; serving stale snapshot", e); // e.g. ESPN outage with cold cache
+          }
         }
       }
       const roster = await loadDoc(store, KEYS.roster(S), { players: [] });
       // Players see the pot total only. Paid/unpaid detail is commissioner business.
-      const publicSnap = { ...snap, pot: { total: snap.pot?.total ?? 0, entries: snap.pot?.entries ?? 0, buybackCash: snap.pot?.buybackCash ?? 0, buybacks: snap.pot?.buybacks ?? 0, buyIn: snap.pot?.buyIn ?? cfg.buyIn } };
+      const { total, entries, buybackCash, buybacks, buyIn } = snap.pot;
+      const publicSnap = { ...snap, pot: { total, entries, buybackCash, buybacks, buyIn } };
       delete publicSnap.splitPreview;
 
       // Anti-sniping: picks are invisible league-wide until their game starts.
@@ -676,7 +689,7 @@ export default async (req, context) => {
       }
       publicSnap.slots = (snap.slots || []).map((r) => (privileged ? r : publicSlotView(r, mineIds.has(r.id), snap.week)));
       publicSnap.slots = publicSnap.slots.map(slimRow);
-      delete publicSnap.riders; // the client derives riders from revealed rows itself
+      delete publicSnap.riders; // a snapshot stored before the rules stopped building this still carries it, unrevealed picks included
 
       // Your own tab, nobody else's: an unpaid buy-in plus any buy-back you have
       // declared that the commissioner has not marked received yet. The buy-back
@@ -701,18 +714,7 @@ export default async (req, context) => {
         owed,
         cfg: publicCfg(cfg),
         players: roster.players.map((p) => ({ id: p.id, name: p.name, managedBy: p.managedBy || null })),
-        serverNow: now.toISOString(),
         appVersion: APP_BUILD,
-        hostReady: hostConfigured(),
-        mailReady: mailConfig().ready,
-        // Counts only, never addresses: lets the commissioner see reminder reach.
-        contactCoverage: {
-          players: roster.players.length,
-          withEmail: roster.players.filter((p) => hasEmail(p)).length,
-          withPhone: roster.players.filter((p) => String(p.phone || "").replace(/\D/g, "").length >= 10).length,
-          // heads of household we cannot email (members ride on their manager's address)
-          missingEmailHeads: roster.players.filter((p) => !p.managedBy && !hasEmail(p)).map((p) => p.name).sort(),
-        },
       });
     }
 
@@ -785,7 +787,7 @@ export default async (req, context) => {
       if (path === "/api/reminders" && url.searchParams.get("test") !== "1" && mailConfig().ready) return bad("The app sends reminders itself now. Delete this Apps Script's triggers (the clock icon in the script editor).", 410);
       const roster = await loadDoc(store, KEYS.roster(S), { players: [] });
       let snap = await getJSON(store, KEYS.snapshot(S));
-      if (snapshotIsStale(snap, now) || snap?.pot?.total === undefined) snap = await rebuild(store, cfg, now);
+      if (snapshotIsStale(snap, now)) snap = await rebuild(store, cfg, now);
       const week = snap.week;
       const games = (await getSchedule(store, cfg, week, now)).games || [];
       const origin = `${url.protocol}//${url.host}`;
@@ -955,7 +957,7 @@ export default async (req, context) => {
           loadDoc(store, KEYS.slots(S), { slots: [] }),
         ]);
         const person = roster.players.find((p) => p.id === who);
-        if (!person) return bad(admin ? "Unknown player." : "Unknown player.", admin ? 404 : 401);
+        if (!person) return bad("Unknown player.", admin ? 404 : 401);
         const managed = new Set(roster.players.filter((p) => p.managedBy === who).map((p) => p.id));
         slotIds = new Set(slotsDoc.slots.filter((x) => x.playerId === who || managed.has(x.playerId)).map((x) => x.id));
         actorId = who;
@@ -1060,15 +1062,20 @@ export default async (req, context) => {
       const limit = Math.min(Number(url.searchParams.get("limit") || 150), 300);
       const prefix = KEYS.chat(S);
       const allKeys = await listKeys(store, prefix);
-      const keys = allKeys.slice(-limit);
-      const values = await getManyJSON(store, keys);
-      const messages = keys.map((k, i) => (values[i] ? { id: k, ...values[i], text: cleanText(values[i].text, cfg.chatBlocklist) } : null)).filter(Boolean);
       // Keys carry the post time, so "how many since I last looked" costs no blob reads.
       const msOf = (k) => Number(k.slice(prefix.length, prefix.length + 14)) || 0;
       const since = Number(url.searchParams.get("since")) || 0;
       const newest = allKeys.length ? msOf(allKeys[allKeys.length - 1]) : 0;
       const newer = since ? allKeys.filter((k) => msOf(k) > since).length : 0;
-      return json({ messages, newest, newer, total: allKeys.length });
+      // An open chat asks again every 45s. Newest post time plus the count names
+      // the list (a post moves one, a delete the other), so a reader who already
+      // holds this list gets told so before a single message blob is read.
+      const tag = `${newest}:${allKeys.length}`;
+      if (url.searchParams.get("have") === tag) return json({ unchanged: true });
+      const keys = allKeys.slice(-limit);
+      const values = await getManyJSON(store, keys);
+      const messages = keys.map((k, i) => (values[i] ? { id: k, ...values[i], text: cleanText(values[i].text, cfg.chatBlocklist) } : null)).filter(Boolean);
+      return json({ messages, newest, newer, total: allKeys.length, tag });
     }
 
     if (path === "/api/chat" && method === "POST") {
@@ -1331,6 +1338,7 @@ export default async (req, context) => {
       if (name.length < 2 || name.length > 40) return bad("Name must be 2 to 40 characters.");
       if (RESERVED_NAMES.test(name)) return bad("That name is reserved.");
       if (/^[=+\-@]/.test(name)) return bad("Names can't start with a symbol.");
+      if (!isClean(name, cfg.chatBlocklist)) return bad("Pick a cleaner name.");
       let nmErr = null, oldName = null, actorName = null, targetId = null, unchanged = false;
       await mutateDoc(store, KEYS.roster(S), { players: [] }, (r) => {
         const me = r.players.find((p) => p.id === sub);
@@ -1514,7 +1522,7 @@ export default async (req, context) => {
       const pickBlobs = await listJSON(store, KEYS.pickPrefix(S, slot.id));
       const picks = {};
       for (const { key, value } of pickBlobs) picks[Number(key.split(":")[3])] = value;
-      const schedules = await getSchedules(store, cfg, new Set(Object.keys(picks).map(Number)), now);
+      const schedules = await getSchedules(store, cfg, new Set(Object.keys(picks).map(Number)), now, overrides);
       const evaluation = evaluateSlot({ slot, picks, revivals: revivals.entries, schedules, overrides, cfg, now });
       const check = validateBuyback({ evaluation, lossWeek, cfg, now });
       if (!check.ok) return bad(check.error, 422);

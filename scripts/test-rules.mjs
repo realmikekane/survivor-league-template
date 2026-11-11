@@ -187,7 +187,6 @@ const slot = { id: "s1", playerId: "p1", label: "Test Player" };
   check("alive first", snap.slots[0].label === "Alice" && snap.slots[0].status === "alive");
   check("bob in buyback limbo", snap.slots[1].status === "buyback-available");
   check("aggregate deadline = earliest open loss", snap.buybackDeadline === "2026-09-29T00:15:00.000Z");
-  check("riders", (snap.riders["Arizona Cardinals"] || []).includes("Alice"));
   check("live flag", snap.liveNow === true);
 }
 

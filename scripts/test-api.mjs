@@ -98,11 +98,16 @@ async function call(path, body, method) {
   const req = new Request("https://test.local" + path, body !== undefined
     ? { method: "POST", body: JSON.stringify(body) }
     : { method: method || "GET" });
-  const res = await handler(req);
+  // Netlify hands the function a context; work passed to waitUntil outlives the
+  // response. Here it is collected and finished before the next call, and `bg`
+  // says how much of it there was.
+  const bg = [];
+  const res = await handler(req, { waitUntil: (p) => bg.push(p) });
   const text = await res.text();
+  await Promise.all(bg);
   let json = null;
   try { json = JSON.parse(text); } catch {}
-  return { status: res.status, json, text };
+  return { status: res.status, json, text, bg: bg.length };
 }
 
 /* ---- flows ---- */
@@ -261,8 +266,7 @@ r = await call("/api/setcontact", { token: c1.json.token, memberId: KID.playerId
 check("stranger blocked from member contact", r.status === 403);
 r = await call("/api/state");
 check("contact stays out of public state", r.json.players.every((p) => p.email === undefined && p.phone === undefined));
-check("coverage counts only", r.json.contactCoverage.withEmail === 2 && r.json.contactCoverage.withPhone === 2 && r.json.contactCoverage.players === r.json.players.length, JSON.stringify(r.json.contactCoverage));
-check("missing-email heads listed, members excluded", r.json.contactCoverage.missingEmailHeads.includes("Race One") && !r.json.contactCoverage.missingEmailHeads.includes("Alpha Kid") && !r.json.contactCoverage.missingEmailHeads.includes("Alpha Prime"), JSON.stringify(r.json.contactCoverage.missingEmailHeads));
+check("no roster detail rides along for strangers", r.json.contactCoverage === undefined && !/missingEmail/.test(r.text));
 
 // reminder payload: one household, every slot's line, kickoff window, formats
 r = await call("/api/reminder");
@@ -415,11 +419,25 @@ r = await call(`/api/admin/full?token=${ADMIN}`);
 check("desk sees host status", r.json.host?.configured === true && r.json.host.unpromptedToday === 1 && r.json.host.repliesToday === 2 && r.json.host.attemptsToday === 3, JSON.stringify(r.json.host));
 r = await call("/api/join", { name: "Sh!thead Jones", pin: "1234", email: "sj@test.com", slots: 1 });
 check("profane name refused", r.status === 400 && /cleaner/.test(r.text), r.text.slice(0, 80));
+r = await call("/api/setname", { token: A.token, name: "Sh!thead Prime" });
+check("a rename goes through the same filter as joining", r.status === 400 && /cleaner/.test(r.text), r.text.slice(0, 80));
 // unread count comes from the keys, not the blobs
 r = await call("/api/chat?limit=1&since=1");
 check("chat GET reports newest and newer", r.status === 200 && r.json.newest > 1e12 && r.json.newer === r.json.total && r.json.messages.length === 1, JSON.stringify({ newest: r.json.newest, newer: r.json.newer, total: r.json.total }));
 r = await call(`/api/chat?limit=1&since=${r.json.newest}`);
 check("nothing newer than the newest", r.json.newer === 0);
+// an open chat polls: a reader who already holds the list is told so, a post or a delete changes the answer
+r = await call("/api/chat?limit=150");
+const chatTag = r.json.tag;
+r = await call(`/api/chat?limit=150&have=${chatTag}`);
+check("chat poll with nothing new sends no messages", r.status === 200 && r.json.unchanged === true && r.json.messages === undefined, r.text.slice(0, 120));
+await call("/api/chat", { token: A.token, text: "one more for the poll test" });
+r = await call(`/api/chat?limit=150&have=${chatTag}`);
+check("a new post answers the poll in full", !r.json.unchanged && r.json.tag !== chatTag && r.json.messages.at(-1).text === "one more for the poll test", r.text.slice(0, 120));
+const chatTag2 = r.json.tag;
+await call("/api/admin/op", { token: ADMIN, op: "deleteChat", id: r.json.messages.at(-1).id });
+r = await call(`/api/chat?limit=150&have=${chatTag2}`);
+check("a delete answers the poll in full", !r.json.unchanged && r.json.tag !== chatTag2 && r.json.messages.every((m) => m.text !== "one more for the poll test"), r.text.slice(0, 120));
 // sign-ups close themselves once week 1's last game has started; admin PIN must be 8+
 {
   const sk = "sched:2026:1";
@@ -492,13 +510,13 @@ check("send refuses until configured", r.status === 503, r.text.slice(0, 120));
 process.env.REMINDER_FROM = "Survivor League <reminders@example.com>"; process.env.REMINDER_SUMMARY_TO = "commish@example.com";
 r = await call("/api/reminders/send", { token: ADMIN });
 check("the refusal names only what is missing", r.status === 503 && /RESEND_API_KEY/.test(r.text) && !/REMINDER_FROM/.test(r.text), r.text.slice(0, 160));
-r = await call("/api/state");
-check("state says mail is not ready", r.json.mailReady === false, String(r.json.mailReady));
+r = await call(`/api/admin/full?token=${ADMIN}`);
+check("the desk says mail is not ready", r.json.mail.ready === false, JSON.stringify(r.json.mail));
 r = await call(`/api/reminders?token=${ADMIN}&missingOnly=1`);
 check("missingOnly filter", r.json.count === 1 && r.json.items.every((i) => i.missingCount > 0));
 process.env.RESEND_API_KEY = "re_test";
-r = await call("/api/state");
-check("state says mail is ready", r.json.mailReady === true, String(r.json.mailReady));
+r = await call(`/api/admin/full?token=${ADMIN}`);
+check("the desk says mail is ready", r.json.mail.ready === true, JSON.stringify(r.json.mail));
 r = await call(`/api/admin/full?token=${ADMIN}`);
 check("desk sees mail status, never the key", r.json.mail?.ready === true && r.json.mail.from.includes("reminders@example.com") && r.json.mail.summaryTo === "commish@example.com" && !r.text.includes("re_test"), JSON.stringify(r.json.mail));
 r = await call(`/api/reminders?token=${ADMIN}`);
@@ -893,6 +911,37 @@ check("manager slots gone", !r.json.snapshot.slots.some((s) => s.playerId === A.
   r = await call("/api/admin/op", { token: ADM3, op: "undoNextSeason" });
   check("rollover: undo refused after a PIN change", r.status === 409 && /changed their details/.test(r.json.error), r.text);
   globalThis.__SL_TEST_STORE = mainStore;
+}
+
+/* ---- opening the board never waits on a rebuild between games ---- */
+{
+  const store = globalThis.__SL_TEST_STORE;
+  const season = (await storeGet(store, "cfg")).seasonYear, snapKey = `snapshot:${season}`;
+  await call("/api/state"); // make sure a snapshot is stored
+  const age = async (minutes, patch) => {
+    const snap = await storeGet(store, snapKey);
+    Object.assign(snap, { liveNow: false, nextKickoff: new Date(Date.now() + 24 * 3600e3).toISOString(), ...patch, builtAt: new Date(Date.now() - minutes * 60e3).toISOString() });
+    await storeSet(store, snapKey, snap);
+    await storeSet(store, `rebuildlock:${season}`, {}); // the herd lock from the last rebuild would answer for this one
+    return snap.builtAt;
+  };
+  let old = await age(10);
+  r = await call("/api/state");
+  check("quiet and stale: the stored board is served at once", r.status === 200 && r.json.snapshot.builtAt === old && r.bg === 1, JSON.stringify({ builtAt: r.json.snapshot.builtAt, old, bg: r.bg }));
+  check("and the rebuild lands behind the response", (await storeGet(store, snapKey)).builtAt > old);
+  old = await age(10, { nextKickoff: new Date(Date.now() - 60e3).toISOString() });
+  r = await call("/api/state");
+  check("past a kickoff the request waits for the rebuild", r.json.snapshot.builtAt > old && r.bg === 0, JSON.stringify({ builtAt: r.json.snapshot.builtAt, old, bg: r.bg }));
+  old = await age(10, { liveNow: true });
+  r = await call("/api/state");
+  check("during a live game the request waits for the rebuild", r.json.snapshot.builtAt > old && r.bg === 0, JSON.stringify({ builtAt: r.json.snapshot.builtAt, old, bg: r.bg }));
+  // A snapshot stored by an older build carries a riders map with unrevealed picks in it.
+  old = await age(1, { riders: { "Secret Team": ["Somebody (1)"] } });
+  r = await call("/api/state");
+  check("a stored riders map never reaches a visitor", r.json.snapshot.builtAt === old && r.json.snapshot.riders === undefined && !/Secret Team/.test(r.text), r.text.slice(0, 120));
+  old = await age(120);
+  r = await call("/api/state");
+  check("a board over an hour old is rebuilt before it is shown", r.json.snapshot.builtAt > old && r.bg === 0, JSON.stringify({ builtAt: r.json.snapshot.builtAt, old, bg: r.bg }));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

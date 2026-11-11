@@ -159,7 +159,7 @@ let starSet = (() => { try { return new Set(JSON.parse(localStorage.getItem("sl_
 const saveStars = () => { try { localStorage.setItem("sl_stars", JSON.stringify([...starSet])); } catch {} };
 
 /* ---------- data cache ---------- */
-const APP_BUILD = "2026-10-19a"; // must match api.mjs (a test enforces it)
+const APP_BUILD = "2026-11-10a"; // must match api.mjs (a test enforces it)
 
 /* A phone tab can sleep for weeks and wake up running ancient code (which is
    how a user saw "Missing Pick!" on picks the server had happily saved).
@@ -204,7 +204,7 @@ async function loadState(force = false) {
   const tok = (commishPeek() && session.adminToken) ? session.adminToken : (session.token || "");
   DB.state = await api(`/api/state${tok ? `?token=${encodeURIComponent(tok)}` : ""}`);
   DB.stateAt = Date.now();
-  try { DB.stateSig = JSON.stringify(DB.state.snapshot); } catch { DB.stateSig = String(Date.now()); }
+  DB.stateSig = JSON.stringify({ ...DB.state.snapshot, builtAt: 0 }); // builtAt moves on every server rebuild; alone it is no reason to redraw
   maybeSelfUpdate(DB.state.appVersion);
   const cfg = DB.state.cfg;
   $("#brandName").textContent = cfg.leagueName || "Survivor League";
@@ -363,8 +363,8 @@ function weekState(r, cur, isMine) {
   return { cls: "t-in", tag: `<span class="bbtag ok">Pick in!</span>` };
 }
 
-/* One slot as a standings card. Used by the standings page and the demo gallery. */
-function slotCardHTML(r, curWeek, { open = false, mine = false, reveal = false, star = true, expandBtn = true } = {}) {
+/* One slot as a standings card. */
+function slotCardHTML(r, curWeek, { open = false, mine = false, reveal = false } = {}) {
   const cur = r.weeks[curWeek];
   const ws = weekState(r, cur, mine || reveal); // reveal = commissioner peek: true state is visible, so flag it
   const showEmpty = mine || reveal || r.status === "dead";
@@ -376,11 +376,11 @@ function slotCardHTML(r, curWeek, { open = false, mine = false, reveal = false, 
     : `<span class="bbtag bad" title="No pick yet this week">✍️ Needs a pick</span>`;
   return `<div class="card tight slotcard ${r.status === "dead" ? "dead" : ""} ${mine ? "mine" : ""} ${ws.cls}">
     <div class="row1">
-      ${star ? `<button class="starbtn ${starSet.has(r.id) ? "on" : ""}" data-star="${r.id}" title="Favorite">${starSet.has(r.id) ? "★" : "☆"}</button>` : ""}
+      <button class="starbtn ${starSet.has(r.id) ? "on" : ""}" data-star="${r.id}" title="Favorite">${starSet.has(r.id) ? "★" : "☆"}</button>
       <span class="name">${esc(r.label)}</span>
       ${moneyBags(r.buybacksUsed)}
       ${statusBadge(r, curWeek)}
-      ${expandBtn ? `<button class="expand" data-expand="${r.id}">${open ? "▴" : "▾"}</button>` : ""}
+      <button class="expand" data-expand="${r.id}">${open ? "▴" : "▾"}</button>
     </div>
     <div class="row2">
       <span class="muted small">W${curWeek}:</span>
@@ -390,48 +390,6 @@ function slotCardHTML(r, curWeek, { open = false, mine = false, reveal = false, 
       ${noPick ? todo : ws.tag}
       ${cur?.source === "auto-default" ? `<span class="muted small">(auto)</span>` : ""}
     </div>
-    ${open ? `<div class="timeline">${buildTimeline(r)}</div>` : ""}
-  </div>`;
-}
-
-/* One slot as a My Picks tile. Used by the picks page and the demo gallery. */
-function tileHTML(r, curWeek, cfg, { selected = false, open = false, demo = false, sched = null } = {}) {
-  const cur = r.weeks[curWeek];
-  let pickSelect = "";
-  if (sched && !demo && r.status !== "dead" && !cur?.locked) {
-    const usedWeek = {};
-    for (const [w, rec] of Object.entries(r.weeks || {})) {
-      if (rec?.team && Number(w) !== Number(curWeek)) usedWeek[rec.team] = w;
-    }
-    const nowMs = Date.now();
-    const entries = (sched.games || []).flatMap((g) => [g.away, g.home].filter(Boolean).map((t) => ({
-      name: t.name,
-      kicked: g.state !== "pre" || new Date(g.date).getTime() <= nowMs,
-    }))).sort((a, b) => a.name.localeCompare(b.name));
-    if (entries.length) {
-      const opts = entries.map((t) => {
-        const uw = usedWeek[t.name];
-        const dis = t.kicked || uw;
-        const label = `${t.name}${uw ? ` · picked W${uw}!` : t.kicked ? " · kicked off" : ""}`;
-        return `<option value="${esc(t.name)}" ${dis ? "disabled" : ""} ${cur?.team === t.name ? "selected" : ""}>${esc(label)}</option>`;
-      }).join("");
-      pickSelect = `<div class="t-cta"><select class="tilepick" data-tpslot="${r.id}"><option value="">${cur?.team ? `Change W${curWeek} pick…` : `Pick for W${curWeek}…`}</option>${opts}</select></div>`;
-    }
-  }
-  const avail = Object.entries(r.weeks || {}).filter(([, rec]) => rec?.buyback === "available");
-  const pend = Object.entries(r.weeks || {}).filter(([, rec]) => rec?.buyback === "pending");
-  const bbAttr = (w) => demo ? `data-demo="1"` : `data-buyback="${r.id}" data-loss="${w}"`;
-  const cta =
-    avail.map(([w]) => `<div class="t-cta"><button class="btn sm primary" ${bbAttr(w)}>Buy back W${w} · ${fmtMoney(cfg.buybackFee)}</button></div>`).join("") +
-    (avail.length && r.buybackDeadline ? `<div class="t-cta muted small">buy back by ${fmtDeadline(r.buybackDeadline)} (your next week's last kickoff) or you're out</div>` : "") +
-    pend.map(([w]) => `<div class="t-cta muted small">⏳ W${w} buy-back waiting on the commissioner · keep picking meanwhile</div>`).join("");
-  const ws = weekState(r, cur, true);
-  return `<div class="slottile ${selected ? "selected" : ""} ${r.status === "dead" ? "dead-tile" : ""} ${ws.cls}" data-tile="${r.id}" role="button" tabindex="0" aria-pressed="${selected}">
-    <span class="t-name">${esc(r.label)}<span class="spacer"></span>${moneyBags(r.buybacksUsed)}${statusBadge(r, curWeek)}
-      <button class="expand" data-texpand="${r.id}" title="Pick history">${open ? "▴" : "▾"}</button></span>
-    <span class="t-pick"><span class="t-wk">W${curWeek}</span>${cur?.team ? `${chip(cur.team)}${markFor(cur.result)}${buybackTag(cur)}${cur.locked && cur.result === "pending" ? `<span class="badge brand">locked</span>` : ""}${!cur.locked && !demo ? `<button class="unpick" data-unpick="${r.id}" title="Remove this pick">✕</button>` : ""}` : `<span class="muted">no pick yet</span>`}${ws.tag}</span>
-    ${pickSelect}
-    ${cta}
     ${open ? `<div class="timeline">${buildTimeline(r)}</div>` : ""}
   </div>`;
 }
@@ -516,7 +474,6 @@ function bindLoginForm(players, onSuccess) {
 /* ---------- views ---------- */
 const view = $("#view");
 const expanded = new Set();
-const tileExpanded = new Set();
 let standingsFilter = "";
 let standingsSort = "status"; // status | first | last
 let recapWeek = null; // which finished week the recaps cell is showing
@@ -572,11 +529,9 @@ async function renderStandings() {
     ledgerRow("💀", "Out", standingCounts.out, "st-out"),
     ledgerRow("", "Slots", s.totalSlots, "total"),
   ].join("");
-  const potBuyIn = s.pot.buyIn ?? cfg.buyIn;
-  const potBuybacks = s.pot.buybacks || (cfg.buybackFee ? Math.round((s.pot.buybackCash || 0) / cfg.buybackFee) : 0);
   const potLedger = [
-    ledgerRow("🎟️", `${s.pot.entries} entr${s.pot.entries === 1 ? "y" : "ies"} × ${fmtMoney(potBuyIn)}`, fmtMoney(s.pot.entries * potBuyIn)),
-    ledgerRow("💸", `${potBuybacks} buy-back${potBuybacks === 1 ? "" : "s"}`, fmtMoney(s.pot.buybackCash || 0)),
+    ledgerRow("🎟️", `${s.pot.entries} entr${s.pot.entries === 1 ? "y" : "ies"} × ${fmtMoney(s.pot.buyIn)}`, fmtMoney(s.pot.entries * s.pot.buyIn)),
+    ledgerRow("💸", `${s.pot.buybacks} buy-back${s.pot.buybacks === 1 ? "" : "s"}`, fmtMoney(s.pot.buybackCash)),
     ledgerRow("=", "Pot total", fmtMoney(s.pot.total), "sum"),
   ].join("");
   const isLive = (r) => { const rec = r.weeks?.[s.week]; return !!(rec?.team && rec.locked === true && liveTeams.has(rec.team)); };
@@ -2037,15 +1992,24 @@ async function mountChat(root, { compact = false } = {}) {
         <button class="btn primary" id="chatSend">Send</button>
       </div>` : `<p class="muted small" style="margin:8px 0 0;"><a href="#/login">Log in</a> to talk your talk.</p>`}
   `;
+  let have = "", lastMs = 0; // what this list already shows, so a poll with nothing new costs nothing
   const load = async () => {
     const el = $("#chatList");
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
     try {
-      const { messages } = await api("/api/chat?limit=150");
+      const r = await api(`/api/chat?limit=150${have ? `&have=${have}` : ""}`);
+      if (r.unchanged) {
+        el.querySelectorAll(".when").forEach((w) => (w.textContent = timeAgo(w.dataset.ts))); // only the clock moved
+        if (!document.hidden) markChatSeen(lastMs);
+        return;
+      }
+      have = r.tag;
+      const { messages } = r;
+      lastMs = messages.length ? chatMsOf(messages[messages.length - 1].id) : 0;
       el.innerHTML = messages.length ? messages.map((m) => `
         <div class="chatrow ${m.bot ? "bot" : ""}">
-          <div class="chathead"><b>${esc(m.name)}</b>${m.bot ? ` <span class="badge host">🎤 Host</span>` : m.commish ? ` <span class="badge brand">Commish</span>` : ""}<span class="when">${timeAgo(m.ts)}</span>${session.adminToken ? `<button class="expand" data-delchat="${esc(m.id)}" title="Delete">✕</button>` : ""}</div>
+          <div class="chathead"><b>${esc(m.name)}</b>${m.bot ? ` <span class="badge host">🎤 Host</span>` : m.commish ? ` <span class="badge brand">Commish</span>` : ""}<span class="when" data-ts="${esc(m.ts)}">${timeAgo(m.ts)}</span>${session.adminToken ? `<button class="expand" data-delchat="${esc(m.id)}" title="Delete">✕</button>` : ""}</div>
           <div class="chattext">${esc(m.text)}</div>
         </div>`).join("") : `<p class="muted">No trash talk yet. Someone start it. 🐐 or 🤡, history will decide.</p>`;
       $$("[data-delchat]").forEach((b) => b.addEventListener("click", async () => {
@@ -2053,7 +2017,7 @@ async function mountChat(root, { compact = false } = {}) {
       }));
       if (nearBottom || !el.dataset.loaded) el.scrollTop = el.scrollHeight;
       el.dataset.loaded = "1";
-      if (messages.length && !document.hidden) markChatSeen(chatMsOf(messages[messages.length - 1].id)); // reading it counts as seen
+      if (!document.hidden) markChatSeen(lastMs); // reading it counts as seen
     } catch (e) { el.innerHTML = `<p class="muted">${esc(e.message)}</p>`; }
   };
   await load();
@@ -2089,101 +2053,6 @@ async function renderChat() {
     <div id="chatPage"></div>
   `;
   await mountChat($("#chatPage"));
-}
-
-/* ---------- demo gallery: every status state, synthetic data ---------- */
-async function renderDemo() {
-  const { cfg } = await loadState();
-  const DL = "2026-10-06T00:15:00Z"; // demo buy-back deadline (week 4 MNF)
-  const W = (team, result, buyback, extra = {}) => ({ team, result, locked: true, source: "player", ...(buyback ? { buyback } : {}), ...extra });
-  const mk = (label, weeks, status, extra = {}) => ({
-    id: "demo-" + label.replace(/\W+/g, ""), label, playerId: "demo", playerName: label,
-    weeks, status, eliminatedWeek: extra.eliminatedWeek ?? null, buybacksUsed: extra.buybacksUsed ?? 0,
-    usedTeams: Object.values(weeks).filter(Boolean).map((r) => r.team).filter(Boolean),
-    openLoss: extra.openLoss ?? null, buybackDeadline: extra.deadline === null ? null : DL,
-  });
-
-  const scenarios = [
-    {
-      title: "Lost, hasn't bought back yet",
-      blurb: "The loss just landed. The league sees the amber status; the player sees the buy-back button and the deadline.",
-      curWeek: 3,
-      row: mk("Riley Example", { 1: W("Seattle Seahawks", "win"), 2: W("Denver Broncos", "loss", "available") }, "buyback-available", { openLoss: { lossWeek: 2 } }),
-    },
-    {
-      title: "Buy-back requested, waiting on the money",
-      blurb: "They tapped the button. Until the commissioner confirms the Venmo landed, the slot sits in pending.",
-      curWeek: 3,
-      row: mk("Casey Example", { 1: W("Seattle Seahawks", "win"), 2: W("Denver Broncos", "loss", "pending") }, "buyback-pending", { openLoss: { lossWeek: 2 } }),
-    },
-    {
-      title: "One buy-back used 💸",
-      blurb: "Lost week 1, paid the mulligan, moved on. The ✗ keeps the loss honest; the 💸 tag says it was covered.",
-      curWeek: 3,
-      row: mk("Jordan Example", { 1: W("Miami Dolphins", "loss", "confirmed"), 2: W("Arizona Cardinals", "win"), 3: W("Kansas City Chiefs", "pending", null, { locked: false }) }, "alive", { buybacksUsed: 1 }),
-    },
-    {
-      title: "Two straight losses, two buy-backs 💸💸",
-      blurb: "Back-to-back losing weeks, both bought back. Consecutive ✗ rows each carry their own tag, so the story reads clean.",
-      curWeek: 3,
-      row: mk("Sam Example", { 1: W("New England Patriots", "loss", "confirmed"), 2: W("New York Jets", "loss", "confirmed"), 3: W("Detroit Lions", "win") }, "alive", { buybacksUsed: 2 }),
-    },
-    {
-      title: "Three straight losses, three buy-backs 💸💸💸",
-      blurb: "The nine-lives special: $40 in and still breathing. Week 4 on is sudden death, so this is the last freebie era.",
-      curWeek: 4,
-      row: mk("Alex Example", { 1: W("Carolina Panthers", "loss", "confirmed"), 2: W("New York Giants", "loss", "confirmed"), 3: W("Tennessee Titans", "loss", "confirmed"), 4: W("Buffalo Bills", "pending", null, { locked: false }) }, "alive", { buybacksUsed: 3 }),
-    },
-    {
-      title: "Out: sudden death, no more buy-backs",
-      blurb: "A week 4+ loss is final. No button, no limbo: the skull, the week they died, and a sudden-death tag on the fatal pick.",
-      curWeek: 5,
-      row: mk("Pat Example", { 1: W("Seattle Seahawks", "win"), 2: W("Green Bay Packers", "win"), 3: W("Dallas Cowboys", "win"), 4: W("Tampa Bay Buccaneers", "loss", "sudden-death") }, "dead", { eliminatedWeek: 4, deadline: null }),
-    },
-    {
-      title: "Out: buy-back window closed",
-      blurb: "They lost in a revivable week but never paid by the week 4 deadline. Same skull, different epitaph.",
-      curWeek: 4,
-      row: mk("Drew Example", { 1: W("Carolina Panthers", "loss", "expired") }, "dead", { eliminatedWeek: 1, deadline: null }),
-    },
-  ];
-
-  const gridWeeks = [1, 2, 3, 4, 5];
-  const demoGrid = `
-    <div class="section-h"><h2>The Who's left grid with every state at once</h2><div class="line"></div></div>
-    <p class="muted small">Exactly how these seven examples look as rows on Who's left (the wide grid you see on desktop). Phones show the same rows as cards, like the left column further down.</p>
-    <div class="gridwrap" style="margin-bottom:24px;"><table class="grid">
-      <thead><tr><th class="sticky">Slot</th><th>Status</th>${gridWeeks.map((w) => `<th>W${w}</th>`).join("")}</tr></thead>
-      <tbody>${scenarios.map((sc) => {
-        const r = sc.row;
-        return `<tr class="${r.status === "dead" ? "dead" : ""}">
-          <td class="sticky">${esc(r.label)} ${moneyBags(r.buybacksUsed)}</td>
-          <td>${statusBadge(r, sc.curWeek)}</td>
-          ${gridWeeks.map((w) => {
-            const rec = r.weeks[w];
-            if (!rec?.team) return `<td></td>`;
-            return `<td><span class="cellteam" title="${esc(rec.team)}${rec.buyback === "confirmed" ? " (bought back)" : ""}"><img src="${logoOf(rec.team)}" alt="" loading="lazy">${abbrOf(rec.team).toUpperCase()} ${markFor(rec.result)}${rec.buyback === "confirmed" ? "💸" : ""}</span></td>`;
-          }).join("")}
-        </tr>`;
-      }).join("")}</tbody>
-    </table></div>`;
-
-  view.innerHTML = `
-    <h1>Status gallery</h1>
-    ${hint("🧪 Synthetic examples of every slot state, rendered with the real components. Left: what the league sees on Who's left. Right: what that player sees on My Picks. Nothing here touches real data.")}
-    ${demoGrid}
-    ${scenarios.map((sc) => `
-      <div class="scenario">
-        <h2>${esc(sc.title)}</h2>
-        <p class="muted small">${esc(sc.blurb)}</p>
-        <div class="scengrid">
-          <div><h3>Who's left · everyone sees</h3>${slotCardHTML(sc.row, sc.curWeek, { open: true, star: false, expandBtn: false })}</div>
-          <div><h3>My Picks tile · the player sees</h3>${tileHTML(sc.row, sc.curWeek, cfg, { selected: false, open: true, demo: true })}</div>
-        </div>
-      </div>`).join("")}
-  `;
-  $$("[data-demo]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); toast("Just a demo. The real button lives on your own slot."); }));
-  $$("#view [data-tile]").forEach((b) => b.addEventListener("click", () => {}));
 }
 
 /* ---------- admin ---------- */
@@ -2831,7 +2700,7 @@ async function renderAdmin() {
 const routes = {
   standings: renderStandings, scores: renderScores, picks: renderPicks, money: renderMoney,
   log: renderLog, rules: renderRules, hof: renderHof, join: renderJoin, more: renderMore,
-  admin: renderAdmin, login: renderLogin, account: renderAccount, demo: renderDemo, chat: renderChat,
+  admin: renderAdmin, login: renderLogin, account: renderAccount, chat: renderChat,
   install: renderInstall, season: renderSeason,
 };
 function currentRoute() {
